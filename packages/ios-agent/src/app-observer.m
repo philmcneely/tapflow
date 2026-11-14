@@ -235,11 +235,9 @@ static double tfo_now_ms(void) {
  *
  * `acted` is left out — unknown, never "no" — whenever "nothing fired" would not mean the app did nothing: a touch on a
  * `surface`, a drag (a pan began), a cancelled touch, a view on the responder chain that handles touches in the app's
- * own code, React Native's touch handler (it recognises every touch), a verdict closed late on a busy main queue, an
+ * own code, React Native's touch handler (it recognises every touch), a recogniser on the window that is not one of
+ * UIKit's every-touch ones (it may be the app's or UIKit's), a verdict closed late on a busy main queue, an
  * app leaving the foreground, or a private method below that this iOS does not have.
- *
- * Known to read "no" wrongly: an app's own recogniser attached to the window itself (taken for UIKit's, which live
- * there), when it is the only thing that acted. Not measured in an app yet.
  *
  * Every signal goes to every report still open: two touches under a second apart can each be credited with the
  * other's action, which errs to "acted" — a tap kept, never one dropped. Two fingers lifted far apart (not something
@@ -362,13 +360,13 @@ static BOOL tfo_chain_handles_touches(id view) {
 
 static IMP g_set_state, g_send_actions, g_send_action, g_cv_select, g_tv_select;
 
-/** Not the app's: a recogniser on the window, or one of UIKit's own that watches every touch. */
+/** One of UIKit's own recognisers that watch every touch: its ending says nothing about the app. */
 static BOOL tfo_ambient(id g) {
   NSString *name = NSStringFromClass([g class]);
   for (NSString *prefix in @[ @"_UITouchDurationObserving", @"_UIFlexInteraction", @"_UISystemGestureGate", @"UIScrollViewDelayedTouchesBegan" ]) {
     if ([name hasPrefix:prefix]) return YES;
   }
-  return [tfo_send(g, "view") isKindOfClass:NSClassFromString(@"UIWindow")];
+  return NO;
 }
 
 static void tfo_set_state(id g, SEL cmd, NSInteger state) {
@@ -380,6 +378,9 @@ static void tfo_set_state(id g, SEL cmd, NSInteger state) {
     return;
   }
   if (state != 3 || tfo_ambient(g)) return;
+  // Any other recogniser on the window may be the app's own (a tap that closes the keyboard) or UIKit's: not "acted",
+  // and not "nothing acted" either (CodeRabbit, #1168).
+  if ([tfo_send(g, "view") isKindOfClass:NSClassFromString(@"UIWindow")]) { tfo_mark_all(NO, YES); return; }
   // React Native's handler recognises every touch, a tap on nothing included: it says nothing about acting.
   if ([NSStringFromClass([g class]) hasPrefix:@"RCT"]) { tfo_mark_all(NO, YES); return; }
   tfo_mark_all(YES, NO);

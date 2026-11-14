@@ -1073,6 +1073,35 @@ describe('IOSAgent', () => {
       browser.close()
     })
 
+    // CodeRabbit on #1168: a take in flight when a boot replaced the watch put what it read off disk into the old one.
+    it('gives a report taken across a re-boot to the gesture of the boot that is current', async () => {
+      const watch = vi.spyOn(AppObserver.prototype, 'watchTouches').mockResolvedValue()
+      let release!: (r: AppTouchReport[]) => void
+      const held = new Promise<AppTouchReport[]>((r) => { release = r })
+      let calls = 0
+      const take = vi.spyOn(AppObserver.prototype, 'takeTouches').mockImplementation(async () => (++calls === 1 ? held : []))
+      const { agent, browser, internals, sent } = await bootedAgent(mockSimctl(true), false)
+      const boot = async (n: number) => {
+        internals.handleRelayMessage({ type: 'device:boot', sessionId: agent.sessionId!, requestId: `rq-${n}`, payload: { deviceId: 'dev-1', recorded: true, touchObservations: true } } as never)
+        await vi.waitFor(() => expect(sent.filter((m) => m.type === 'device:ready')).toHaveLength(n), { timeout: 3000 })
+        internals.lastBundleIds.set('dev-1', 'com.app')
+      }
+      await boot(1)
+      internals.handleRelayMessage({ type: 'input:touch:start', sessionId: agent.sessionId!, payload: { x: 0.9, y: 0.9 } } as never)
+      internals.handleRelayMessage({ type: 'input:touch:end', sessionId: agent.sessionId!, requestId: 'g1' } as never)
+      await vi.waitFor(() => expect(calls).toBe(1))
+      await boot(2)
+      const t2 = Date.now()
+      internals.handleRelayMessage({ type: 'input:touch:start', sessionId: agent.sessionId!, payload: { x: 0.4, y: 0.5 } } as never)
+      internals.handleRelayMessage({ type: 'input:touch:end', sessionId: agent.sessionId!, requestId: 'g2' } as never)
+      // The first gesture's take comes back now, with the report of the second.
+      release([{ seq: 1, at: t2, bundle: 'com.app', observation: { point: { x: 0.4, y: 0.5 }, moving: false } }])
+      await vi.waitFor(() => expect(sent.filter((m) => m.type === 'capture:touched').map((m) => m['requestId'])).toEqual(['g2']), { timeout: 2000 })
+      watch.mockRestore(); take.mockRestore()
+      agent.disconnect()
+      browser.close()
+    })
+
     it('sends nothing more for a verdict that is unknown', async () => {
       const watch = vi.spyOn(AppObserver.prototype, 'watchTouches').mockResolvedValue()
       const queue: AppTouchReport[][] = []

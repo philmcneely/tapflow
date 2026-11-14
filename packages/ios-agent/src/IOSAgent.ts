@@ -1499,7 +1499,11 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
     const until = Date.now() + TOUCH_REPORT_WAIT_MS
     for (;;) {
       // Taken before it is added: a concurrent pairing replaces nothing under it (the list is changed in place only).
-      this.keepTouchReports(watch, await this.appObserver.takeTouches(deviceId).catch(() => [] as AppTouchReport[]))
+      const taken = await this.appObserver.takeTouches(deviceId).catch(() => [] as AppTouchReport[])
+      // A boot that replaced the watch during the take owns what came off disk; this gesture's report went with the old.
+      const current = this.touchWatch.get(deviceId)
+      if (current !== watch) { if (current) this.keepTouchReports(current, taken); return }
+      this.keepTouchReports(watch, taken)
       // A report is kept while it is recent, or as old as this gesture: a long press's ends past the keep window.
       for (let k = watch.reports.length - 1; k >= 0; k--) {
         const r = watch.reports[k]!
@@ -1555,7 +1559,11 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
       }
       if (Date.now() >= until) return
       await new Promise((r) => setTimeout(r, TOUCH_REPORT_POLL_MS))
-      this.keepTouchReports(watch, await this.appObserver.takeTouches(deviceId).catch(() => [] as AppTouchReport[]))
+      const taken = await this.appObserver.takeTouches(deviceId).catch(() => [] as AppTouchReport[])
+      // Into the watch current now: a boot during the wait replaced it, and what was taken off disk is the new one's
+      // (CodeRabbit, #1168). With none left, they go as they would at teardown.
+      const current = this.touchWatch.get(deviceId)
+      if (current) this.keepTouchReports(current, taken)
     }
   }
 
