@@ -46,6 +46,9 @@ const TOUCH_REPORT_WAIT_MS = 500
 const TOUCH_END_WAIT_MS = 3_000
 // Verdicts no pairing came for (a gesture whose down report was never paired) are not kept past this many.
 const TOUCH_END_KEEP = 16
+
+/** One touch across app processes: a seq restarts with each, so a verdict is kept and found by all three (CodeRabbit, #1168). */
+const touchKey = (t: { bundle: string; seq: number; at: number }): string => `${t.bundle}:${t.seq}:${t.at}`
 const TOUCH_REPORT_POLL_MS = 50
 const TOUCH_REPORT_KEEP_MS = 5_000
 const TOUCH_REPORT_SKEW_MS = 1_500
@@ -414,7 +417,7 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
   private readonly installing = new Map<string, Map<string, number>>()
   // Devices whose app reports each touch-down, while a person is recorded on a relay that keeps them (record-time
   // observation): the gestures sent there, newest last, and the reports not yet paired with one.
-  private readonly touchWatch = new Map<string, { since: number; starts: Array<{ x: number; y: number; at: number }>; reports: AppTouch[]; ends: Map<number, AppTouchEnd> }>()
+  private readonly touchWatch = new Map<string, { since: number; starts: Array<{ x: number; y: number; at: number }>; reports: AppTouch[]; ends: Map<string, AppTouchEnd> }>()
   // Holds a macOS power assertion while connected so the host doesn't idle-throttle the
   // simulator capture/encode when the Mac is unattended. No-op off macOS.
   private readonly sleepBlocker: SleepBlocker
@@ -1533,9 +1536,9 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
    * report from before the watch began is a gesture of the boot it replaced, taken off disk across it: kept, a gesture
    * of the new boot at the same spot could pair with it before its own report lands (CodeRabbit, #1168).
    */
-  private keepTouchReports(watch: { since: number; reports: AppTouch[]; ends: Map<number, AppTouchEnd> }, taken: AppTouchReport[]): void {
+  private keepTouchReports(watch: { since: number; reports: AppTouch[]; ends: Map<string, AppTouchEnd> }, taken: AppTouchReport[]): void {
     for (const r of taken) {
-      if ('end' in r) watch.ends.set(r.seq, r)
+      if ('end' in r) watch.ends.set(touchKey(r), r)
       else if (r.at >= watch.since) watch.reports.push(r)
     }
     for (const seq of watch.ends.keys()) {
@@ -1554,10 +1557,10 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
     for (;;) {
       const watch = this.touchWatch.get(deviceId)
       if (!watch) return
-      const end = watch.ends.get(report.seq)
-      // A seq starts again with each app process: the down's time is what tells this touch from an earlier one.
-      if (end && end.bundle === report.bundle && end.at === report.at) {
-        watch.ends.delete(report.seq)
+      // A seq starts again with each app process: the bundle and the down's time are what tell this touch from another.
+      const end = watch.ends.get(touchKey(report))
+      if (end) {
+        watch.ends.delete(touchKey(report))
         if (end.acted !== undefined) this.sendMsg({ type: 'capture:touched', sessionId, requestId, observation: { ...report.observation, acted: end.acted } })
         return
       }

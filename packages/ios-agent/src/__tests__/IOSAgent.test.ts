@@ -1059,16 +1059,17 @@ describe('IOSAgent', () => {
       queue.push([down(2, t2, 2)])
       internals.handleRelayMessage({ type: 'input:touch:end', sessionId: agent.sessionId!, requestId: 'g2' } as never)
       await vi.waitFor(() => expect(sent.filter((m) => m.type === 'capture:touched')).toHaveLength(2), { timeout: 2000 })
-      // The second touch's verdict first, an earlier process's seq 1 among them, and a verdict that knows nothing.
+      // The second touch's verdict first, an earlier process's seq 1 among them; seq 1's own arrives in the same take
+      // and must not be lost to the other (CodeRabbit, #1168), whichever the directory lists first.
       queue.push([
         { seq: 2, at: t2, bundle: 'com.app', end: true, acted: true },
+        { seq: 1, at: t1, bundle: 'com.app', end: true, acted: false },
         { seq: 1, at: t1 - 60_000, bundle: 'com.app', end: true, acted: true },
       ])
-      await vi.waitFor(() => expect(sent.filter((m) => m.type === 'capture:touched')).toHaveLength(3), { timeout: 2000 })
-      queue.push([{ seq: 1, at: t1, bundle: 'com.app', end: true, acted: false }])
       await vi.waitFor(() => expect(sent.filter((m) => m.type === 'capture:touched')).toHaveLength(4), { timeout: 2000 })
       const later = sent.filter((m) => m.type === 'capture:touched').slice(2).map((m) => [m['requestId'], (m['observation'] as { acted?: boolean; tapCount?: number })])
-      expect(later).toEqual([['g2', { point: { x: 0.4, y: 0.5 }, moving: false, tapCount: 2, acted: true }], ['g1', { point: { x: 0.4, y: 0.5 }, moving: false, tapCount: 1, acted: false }]])
+      later.sort((a, b) => String(a[0]).localeCompare(String(b[0])))
+      expect(later).toEqual([['g1', { point: { x: 0.4, y: 0.5 }, moving: false, tapCount: 1, acted: false }], ['g2', { point: { x: 0.4, y: 0.5 }, moving: false, tapCount: 2, acted: true }]])
       watch.mockRestore(); take.mockRestore()
       agent.disconnect()
       browser.close()
