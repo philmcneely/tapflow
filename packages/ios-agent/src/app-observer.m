@@ -352,6 +352,7 @@ static BOOL tfo_handles_touches(Class cls) {
 
 static BOOL tfo_chain_handles_touches(id view) {
   // A SpriteKit view hands its touches to its scene, which is not on the responder chain: a game's own code either way.
+  // A HUD button laid over the scene is taken as unknown too — a kept tap, never a dropped one.
   Class sk = NSClassFromString(@"SKView");
   for (id r = view; r; r = tfo_send(r, "nextResponder")) {
     if ((sk && [r isKindOfClass:sk]) || tfo_handles_touches(object_getClass(r))) return YES;
@@ -445,8 +446,8 @@ static NSString *tfo_surface(id window, id view) {
   Class content = NSClassFromString(@"WKContentView");
   for (id v = view; v && v != window; v = tfo_send(v, "superview")) {
     NSString *name = NSStringFromClass([v class]);
-    // Reached the scroll view before any web content: a view of the app's own, laid over the page.
-    if ([name isEqualToString:@"WKScrollView"]) return nil;
+    // Reached the scroll view or the web view before any web content: a view of the app's own, laid over the page.
+    if ([name isEqualToString:@"WKScrollView"] || [v isKindOfClass:NSClassFromString(@"WKWebView")]) return nil;
     if ((content && [v isKindOfClass:content]) || [name hasPrefix:@"WK"]) return @"web";
   }
   return nil;
