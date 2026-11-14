@@ -238,6 +238,9 @@ static double tfo_now_ms(void) {
  * own code, React Native's touch handler (it recognises every touch), a verdict closed late on a busy main queue, an
  * app leaving the foreground, or a private method below that this iOS does not have.
  *
+ * Known to read "no" wrongly: an app's own recogniser attached to the window itself (taken for UIKit's, which live
+ * there), when it is the only thing that acted. Not measured in an app yet.
+ *
  * Every signal goes to every report still open: two touches under a second apart can each be credited with the
  * other's action, which errs to "acted" — a tap kept, never one dropped. Two fingers lifted far apart (not something
  * the agent sends) would close the first finger's report early; no path reaches that today.
@@ -289,7 +292,8 @@ static void tfo_mark_all(BOOL acted, BOOL unknown) {
 
 /** A new touch-down: older reports past their life are closed unknown, and the oldest gives way when all are taken. */
 static void tfo_open(uint64_t seq, double at, uintptr_t touch, NSInteger tapCount) {
-  for (int i = g_open_n - 1; i >= 0; i--) if (at - g_open[i].at > TFO_OPEN_LIFE_MS) tfo_close_at(i, YES);
+  // Rescanned from the end after each close: a close takes the touches held for it too, from anywhere in the array.
+  for (int i = g_open_n - 1; i >= 0; i--) if (at - g_open[i].at > TFO_OPEN_LIFE_MS) { tfo_close_at(i, YES); i = g_open_n; }
   if (g_open_n == TFO_OPEN_MAX) {
     int oldest = 0;
     for (int i = 1; i < g_open_n; i++) if (g_open[i].at < g_open[oldest].at) oldest = i;
@@ -347,7 +351,11 @@ static BOOL tfo_handles_touches(Class cls) {
 }
 
 static BOOL tfo_chain_handles_touches(id view) {
-  for (id r = view; r; r = tfo_send(r, "nextResponder")) if (tfo_handles_touches(object_getClass(r))) return YES;
+  // A SpriteKit view hands its touches to its scene, which is not on the responder chain: a game's own code either way.
+  Class sk = NSClassFromString(@"SKView");
+  for (id r = view; r; r = tfo_send(r, "nextResponder")) {
+    if ((sk && [r isKindOfClass:sk]) || tfo_handles_touches(object_getClass(r))) return YES;
+  }
   return NO;
 }
 
@@ -430,12 +438,16 @@ static void tfo_install_act_hooks(void) {
 static NSString *tfo_surface(id window, id view) {
   NSString *w = NSStringFromClass([window class]);
   if ([w containsString:@"Keyboard"] || [w containsString:@"TextEffects"]) return @"keyboard";
+  if ([NSStringFromClass([view class]) hasPrefix:@"Flutter"]) return @"flutter";
   // The view a touch lands on inside a web view is a plain UIView under WKContentView (iOS 26.5, measured), so the
-  // views it sits in are asked too.
+  // views it sits in are asked too — for the web content only: a native view the app put in the web view's scroll view
+  // is the app's, and named as such.
+  Class content = NSClassFromString(@"WKContentView");
   for (id v = view; v && v != window; v = tfo_send(v, "superview")) {
     NSString *name = NSStringFromClass([v class]);
-    if ([name hasPrefix:@"WK"]) return @"web";
-    if ([name hasPrefix:@"Flutter"]) return @"flutter";
+    // Reached the scroll view before any web content: a view of the app's own, laid over the page.
+    if ([name isEqualToString:@"WKScrollView"]) return nil;
+    if ((content && [v isKindOfClass:content]) || [name hasPrefix:@"WK"]) return @"web";
   }
   return nil;
 }
@@ -545,7 +557,10 @@ static void tfo_warm_later(id window) {
  */
 static void tfo_send_event(id app, SEL cmd, id event) {
   NSMutableArray *began = nil;
-  if (g_dir && tfo_touches_on()) {
+  BOOL recording = g_dir && tfo_touches_on();
+  // Reports left open when recording stopped are dropped: their touches may never end where this can see them.
+  if (!recording) g_open_n = 0;
+  if (recording) {
     tfo_install_act_hooks();
     for (id t in tfo_send(event, "allTouches")) {
       NSInteger phase = tfo_int(t, "phase");
