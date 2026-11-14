@@ -1261,6 +1261,12 @@ describe('touch reports', () => {
     expect([named(steps[0]!), named(steps[1]!)]).toEqual(['Donuts', 'Truck'])
   })
 
+  // P2a: the agent repeats a gesture's report once the app's verdict is in; the later one is the gesture's.
+  it('takes the later of two reports for one gesture', () => {
+    const [tap] = new Rec().touch([[0.3, 0.3]]).touched({ moving: false, tapCount: 1 }).touched({ moving: false, tapCount: 1, acted: false }).steps()
+    expect(tap && 'touched' in tap ? tap.touched : undefined).toEqual({ point: { x: 0, y: 0 }, moving: false, tapCount: 1, acted: false })
+  })
+
   it('does not leave out a moving tap the device refused (already skipped), nor a swipe that began mid-glide', () => {
     const steps = new Rec().touch([[0.5, 0.5]], { ok: false }).touched({ moving: true })
       .wait(500).touch([[0.5, 0.8], [0.5, 0.5], [0.5, 0.3]]).touched({ moving: true }).steps()

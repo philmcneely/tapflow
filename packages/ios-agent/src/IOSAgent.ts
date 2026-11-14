@@ -41,6 +41,14 @@ const RUN_RESET_PASTEBOARD_TIMEOUT_MS = 10_000
 // Pairing the app's touch-down reports with the gestures sent (record-time observation). The report lands within a frame
 // of the touch (one turn of the app's main queue, measured); a tap's end comes 80 ms or more after its start.
 const TOUCH_REPORT_WAIT_MS = 500
+// The app's verdict (`acted`) is written a second after the lift (app-observer.m `TFO_ACT_GRACE_MS`), later on a busy
+// main queue: past this it is not waited for, and the gesture keeps the report it already has.
+const TOUCH_END_WAIT_MS = 3_000
+// Verdicts no pairing came for (a gesture whose down report was never paired) are not kept past this many.
+const TOUCH_END_KEEP = 16
+
+/** One touch across app processes: a seq restarts with each, so a verdict is kept and found by all three (CodeRabbit, #1168). */
+const touchKey = (t: { bundle: string; seq: number; at: number }): string => `${t.bundle}:${t.seq}:${t.at}`
 const TOUCH_REPORT_POLL_MS = 50
 const TOUCH_REPORT_KEEP_MS = 5_000
 const TOUCH_REPORT_SKEW_MS = 1_500
@@ -118,7 +126,7 @@ import { PhysicalOrientation, ORIENTATION_DEGREES, turned, type DeviceOrientatio
 import type { GuestOrientation } from './GuestHelper.js'
 import type { IntegratedScreen } from './panels.js'
 import { XCUITreeReader } from './XCUITreeReader.js'
-import { AppObserver, fieldOf, keyboardOf, type AppTouch, type ObserverRead } from './AppObserver.js'
+import { AppObserver, fieldOf, keyboardOf, type AppTouch, type AppTouchEnd, type AppTouchReport, type ObserverRead } from './AppObserver.js'
 import { AppAccessibility } from './AppAccessibility.js'
 import { DeviceChromeLoader, type ChromeData, type ChromePanel } from './DeviceChromeLoader.js'
 import { TypePanels, panelFrame } from './TypePanels.js'
@@ -409,7 +417,7 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
   private readonly installing = new Map<string, Map<string, number>>()
   // Devices whose app reports each touch-down, while a person is recorded on a relay that keeps them (record-time
   // observation): the gestures sent there, newest last, and the reports not yet paired with one.
-  private readonly touchWatch = new Map<string, { starts: Array<{ x: number; y: number; at: number }>; reports: AppTouch[] }>()
+  private readonly touchWatch = new Map<string, { since: number; starts: Array<{ x: number; y: number; at: number }>; reports: AppTouch[]; ends: Map<string, AppTouchEnd> }>()
   // Holds a macOS power assertion while connected so the host doesn't idle-throttle the
   // simulator capture/encode when the Mac is unattended. No-op off macOS.
   private readonly sleepBlocker: SleepBlocker
@@ -1283,7 +1291,7 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
       if (seq !== state.bootSeq) { this.abandonBoot(state, seq, sessionId, requestId); return }
       // What each touch hits, reported by the app while this person is recorded — only to a relay that keeps it.
       const observeTouches = recorded && touchObservations
-      if (observeTouches) this.touchWatch.set(deviceId, { starts: [], reports: [] })
+      if (observeTouches) this.touchWatch.set(deviceId, { since: Date.now(), starts: [], reports: [], ends: new Map() })
       else this.touchWatch.delete(deviceId)
       await this.appObserver.watchTouches(deviceId, observeTouches).catch((e: unknown) => {
         logger.warn('could not set the app observer\'s touch reports:', (e as Error).message)
@@ -1494,8 +1502,11 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
     const until = Date.now() + TOUCH_REPORT_WAIT_MS
     for (;;) {
       // Taken before it is added: a concurrent pairing replaces nothing under it (the list is changed in place only).
-      const taken = await this.appObserver.takeTouches(deviceId).catch(() => [] as AppTouch[])
-      watch.reports.push(...taken)
+      const taken = await this.appObserver.takeTouches(deviceId).catch(() => [] as AppTouchReport[])
+      // A boot that replaced the watch during the take owns what came off disk; this gesture's report went with the old.
+      const current = this.touchWatch.get(deviceId)
+      if (current !== watch) { if (current) this.keepTouchReports(current, taken); return }
+      this.keepTouchReports(watch, taken)
       // A report is kept while it is recent, or as old as this gesture: a long press's ends past the keep window.
       for (let k = watch.reports.length - 1; k >= 0; k--) {
         const r = watch.reports[k]!
@@ -1512,10 +1523,54 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
       if (i >= 0) {
         const [report] = watch.reports.splice(i, 1)
         this.sendMsg({ type: 'capture:touched', sessionId, requestId, observation: report!.observation })
+        await this.reportTouchEnd(sessionId, deviceId, requestId, report!)
         return
       }
       if (Date.now() >= until || this.touchWatch.get(deviceId) !== watch) return
       await new Promise((r) => setTimeout(r, TOUCH_REPORT_POLL_MS))
+    }
+  }
+
+  /**
+   * Down reports into the list the pairings read, verdicts by seq; verdicts nobody came for are kept to a few. A down
+   * report from before the watch began is a gesture of the boot it replaced, taken off disk across it: kept, a gesture
+   * of the new boot at the same spot could pair with it before its own report lands (CodeRabbit, #1168).
+   */
+  private keepTouchReports(watch: { since: number; reports: AppTouch[]; ends: Map<string, AppTouchEnd> }, taken: AppTouchReport[]): void {
+    for (const r of taken) {
+      if ('end' in r) watch.ends.set(touchKey(r), r)
+      else if (r.at >= watch.since) watch.reports.push(r)
+    }
+    for (const seq of watch.ends.keys()) {
+      if (watch.ends.size <= TOUCH_END_KEEP) break
+      watch.ends.delete(seq)
+    }
+  }
+
+  /**
+   * The app's verdict on the paired touch, matched by its seq (not by point and time: two quick taps at one spot are
+   * told apart exactly), sent as the same report with `acted` — the relay keeps the later. A verdict that says nothing
+   * (unknown) or never comes sends nothing more.
+   */
+  private async reportTouchEnd(sessionId: string, deviceId: string, requestId: string, report: AppTouch): Promise<void> {
+    const until = Date.now() + TOUCH_END_WAIT_MS
+    for (;;) {
+      const watch = this.touchWatch.get(deviceId)
+      if (!watch) return
+      // A seq starts again with each app process: the bundle and the down's time are what tell this touch from another.
+      const end = watch.ends.get(touchKey(report))
+      if (end) {
+        watch.ends.delete(touchKey(report))
+        if (end.acted !== undefined) this.sendMsg({ type: 'capture:touched', sessionId, requestId, observation: { ...report.observation, acted: end.acted } })
+        return
+      }
+      if (Date.now() >= until) return
+      await new Promise((r) => setTimeout(r, TOUCH_REPORT_POLL_MS))
+      const taken = await this.appObserver.takeTouches(deviceId).catch(() => [] as AppTouchReport[])
+      // Into the watch current now: a boot during the wait replaced it, and what was taken off disk is the new one's
+      // (CodeRabbit, #1168). With none left, they go as they would at teardown.
+      const current = this.touchWatch.get(deviceId)
+      if (current) this.keepTouchReports(current, taken)
     }
   }
 

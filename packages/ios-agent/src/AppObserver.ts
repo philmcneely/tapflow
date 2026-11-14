@@ -62,7 +62,7 @@ export class AppObserver {
   // One request at a time per device: the observer answers the request it reads, and a second written before the
   // first is answered would replace it — a keyboard probe and a field read are often asked together.
   private readonly queues = new Map<string, Promise<unknown>>()
-  private readonly touchTakes = new Map<string, Promise<AppTouch[]>>()
+  private readonly touchTakes = new Map<string, Promise<AppTouchReport[]>>()
 
   constructor(private readonly host: ObserverHost, opts: AppObserverOptions = {}) {
     this.root = opts.root ?? '/tmp'
@@ -111,7 +111,7 @@ export class AppObserver {
     const dir = this.dir(udid)
     await rm(join(dir, 'touches'), { force: true })
     for (const name of await readdir(dir).catch(() => [] as string[])) {
-      if (/^touch-\d+\.json(\.tmp)?$/.test(name)) await rm(join(dir, name), { force: true })
+      if (TOUCH_FILE.test(name) || /^touch-\d+(-end)?\.json\.tmp$/.test(name)) await rm(join(dir, name), { force: true })
     }
   }
 
@@ -120,7 +120,7 @@ export class AppObserver {
    * cannot be read is dropped. Stray ones a reader never came for are swept with the answers (5 s), as they name what
    * a person touched.
    */
-  takeTouches(udid: string): Promise<AppTouch[]> {
+  takeTouches(udid: string): Promise<AppTouchReport[]> {
     // One take at a time per device: each gesture's pairing takes on its own, and two takes in flight together both
     // read a report before either removed it, so one touch could be paired with two gestures (CodeRabbit, #1166).
     const next = (this.touchTakes.get(udid) ?? Promise.resolve()).catch(() => undefined).then(() => this.takeTouchFiles(udid))
@@ -129,17 +129,20 @@ export class AppObserver {
     return next
   }
 
-  private async takeTouchFiles(udid: string): Promise<AppTouch[]> {
+  private async takeTouchFiles(udid: string): Promise<AppTouchReport[]> {
     const dir = this.dir(udid)
-    const out: AppTouch[] = []
+    const out: AppTouchReport[] = []
     for (const name of await readdir(dir).catch(() => [] as string[])) {
-      if (!/^touch-\d+\.json$/.test(name)) continue
+      const m = TOUCH_FILE.exec(name)
+      if (!m) continue
       const text = await readFile(join(dir, name), 'utf8').catch(() => undefined)
       await unlink(join(dir, name)).catch(() => undefined)
-      const touch = text === undefined ? undefined : touchOf(parse(text))
+      const body = text === undefined ? undefined : parse(text)
+      const touch = m[1] ? touchEndOf(body) : touchOf(body)
       if (touch) out.push(touch)
     }
-    return out.sort((a, b) => a.seq - b.seq)
+    // A touch's down report before its verdict, whatever order the directory lists them in.
+    return out.sort((a, b) => a.seq - b.seq || Number('end' in a) - Number('end' in b))
   }
 
   read(udid: string, bundleId: string): Promise<ObserverRead> {
@@ -222,6 +225,21 @@ export interface AppTouch {
   observation: TouchObservation
 }
 
+/** The app's verdict on touch `seq`, written once it lifted and the app had time to act (`touch-<seq>-end.json`). */
+export interface AppTouchEnd {
+  seq: number
+  /** The touch-down's `at`, as its report says it: with the seq, what names one touch across app relaunches. */
+  at: number
+  bundle: string
+  end: true
+  acted?: boolean
+}
+
+export type AppTouchReport = AppTouch | AppTouchEnd
+
+/** A touch-down's report, or (`-end`) the verdict that follows it. */
+const TOUCH_FILE = /^touch-\d+(-end)?\.json$/
+
 /** The longest identifier or label a touch report keeps. */
 const OBSERVED_TEXT_MAX = 256
 
@@ -233,6 +251,8 @@ function touchOf(body: Record<string, unknown> | undefined): AppTouch | undefine
   const point = body['point'] as Record<string, unknown> | undefined
   if (!num(body['seq']) || !num(body['at']) || typeof body['bundle'] !== 'string' || !point || !num(point['x']) || !num(point['y'])) return undefined
   const observation: TouchObservation = { point: { x: point['x'], y: point['y'] }, moving: body['moving'] === true }
+  const tapCount = body['tapCount']
+  if (typeof tapCount === 'number' && Number.isInteger(tapCount) && tapCount > 0) observation.tapCount = tapCount
   const surface = body['surface']
   if (surface === 'keyboard' || surface === 'web' || surface === 'flutter') {
     observation.surface = surface
@@ -243,6 +263,12 @@ function touchOf(body: Record<string, unknown> | undefined): AppTouch | undefine
     if (button) observation.button = button
   }
   return { seq: body['seq'], at: body['at'], bundle: body['bundle'], observation }
+}
+
+function touchEndOf(body: Record<string, unknown> | undefined): AppTouchEnd | undefined {
+  if (!body || !num(body['seq']) || !num(body['at']) || typeof body['bundle'] !== 'string') return undefined
+  const acted = body['acted']
+  return { seq: body['seq'], at: body['at'], bundle: body['bundle'], end: true, ...(typeof acted === 'boolean' ? { acted } : {}) }
 }
 
 function elementOf(v: unknown): ObservedElement | undefined {

@@ -2,7 +2,7 @@ import { describe, it, expect, afterEach, vi } from 'vitest'
 import { mkdtempSync, rmSync, statSync, readdirSync, writeFileSync, symlinkSync, mkdirSync, existsSync, readFileSync, lstatSync, utimesSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { AppObserver, fieldOf, keyboardOf, type ObserverRead } from '../AppObserver'
+import { AppObserver, fieldOf, keyboardOf, type AppTouch, type ObserverRead } from '../AppObserver'
 
 // The host side of the app observer (#1135): the code inside the app answers a nonce written to `request`, and the
 // agent judges what it reads. These hold that judgement; app-observer.m itself is measured on a simulator (AGENTS.md).
@@ -183,6 +183,8 @@ describe('the app\'s touch reports', () => {
     await observer.watchTouches(UDID, true)
     writeFileSync(join(dir, 'touch-1.json'), '{}')
     writeFileSync(join(dir, 'touch-2.json.tmp'), '{}')
+    writeFileSync(join(dir, 'touch-2-end.json'), '{}')
+    writeFileSync(join(dir, 'touch-3-end.json.tmp'), '{}')
     writeFileSync(join(dir, 'background'), 'com.app')
     await observer.stopTouches(UDID)
     expect(readdirSync(dir).sort()).toEqual(['background'])
@@ -197,11 +199,31 @@ describe('the app\'s touch reports', () => {
     expect(takes.flat().map((t) => t.seq).sort()).toEqual([1, 2, 3, 4, 5])
   })
 
+  // P2a: the verdict that follows a touch-down, and iOS's own count of a quick repeat.
+  it('reads a verdict file beside the down reports, and the tap count a down report carries', async () => {
+    const { observer, dir } = setup()
+    await observer.prepare(UDID)
+    writeFileSync(join(dir, 'touch-1.json'), JSON.stringify({ seq: 1, at: 10, bundle: 'com.app', point: { x: 0.5, y: 0.5 }, moving: false, tapCount: 2 }))
+    writeFileSync(join(dir, 'touch-1-end.json'), JSON.stringify({ seq: 1, at: 10, bundle: 'com.app', acted: false }))
+    writeFileSync(join(dir, 'touch-2-end.json'), JSON.stringify({ seq: 2, at: 11, bundle: 'com.app', acted: 'yes' }))
+    writeFileSync(join(dir, 'touch-3-end.json'), JSON.stringify({ seq: 3, bundle: 'com.app', acted: true }))
+    writeFileSync(join(dir, 'touch-4.json'), JSON.stringify({ seq: 4, at: 12, bundle: 'com.app', point: { x: 0, y: 0 }, moving: false, tapCount: 0 }))
+    const taken = await observer.takeTouches(UDID)
+    expect(taken).toEqual([
+      { seq: 1, at: 10, bundle: 'com.app', observation: { point: { x: 0.5, y: 0.5 }, moving: false, tapCount: 2 } },
+      { seq: 1, at: 10, bundle: 'com.app', end: true, acted: false },
+      // Not a boolean: the verdict is unknown, not refused.
+      { seq: 2, at: 11, bundle: 'com.app', end: true },
+      { seq: 4, at: 12, bundle: 'com.app', observation: { point: { x: 0, y: 0 }, moving: false } },
+    ])
+    expect(readdirSync(dir).filter((f) => f.startsWith('touch-'))).toEqual([])
+  })
+
   it('cuts a long label or identifier, which would fill the capture on every tap', async () => {
     const { observer, dir } = setup()
     await observer.prepare(UDID)
     writeFileSync(join(dir, 'touch-1.json'), JSON.stringify({ seq: 1, at: 1, bundle: 'com.app', point: { x: 0, y: 0 }, moving: false, element: { label: 'x'.repeat(5000), identifier: 'y'.repeat(5000), traits: 0 } }))
-    const [t] = await observer.takeTouches(UDID)
+    const [t] = await observer.takeTouches(UDID) as AppTouch[]
     expect(t!.observation.element!.label).toHaveLength(256)
     expect(t!.observation.element!.identifier).toHaveLength(256)
   })
@@ -219,7 +241,7 @@ describe('the app\'s touch reports', () => {
     write(10, { moving: false })
     writeFileSync(join(dir, 'touch-5.json'), 'not json')
     writeFileSync(join(dir, 'touch-6.json'), JSON.stringify({ seq: 6, at: 'soon', bundle: 'com.app', point: { x: 0, y: 0 } }))
-    const touches = await observer.takeTouches(UDID)
+    const touches = await observer.takeTouches(UDID) as AppTouch[]
     expect(touches.map((t) => t.seq)).toEqual([1, 2, 3, 4, 10])
     expect(touches[0]!.observation).toEqual({ point: { x: 0.5, y: 0.4 }, moving: true })
     expect(touches[1]!.observation.element).toEqual({ label: 'Donuts', identifier: 'd', traits: 1, frame: { x: 0.1, y: 0.2, width: 0.3, height: 0.04 } })
