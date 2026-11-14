@@ -288,6 +288,7 @@ const TOUCH_KINDS = new Set<RawStep['kind']>(['tap', 'longPress', 'swipe', 'hold
  */
 function withTouches(steps: RawStep[], entries: readonly CaptureEntry[]): RawStep[] {
   const reports = new Map<string, TouchObservation>()
+  // The later of two for one gesture: the agent repeats the report once the app's verdict (`acted`) is in.
   for (const e of entries) if (e.kind === 'touched') reports.set(e.requestId, e.touched)
   if (reports.size === 0) return steps
   return steps.map((s) => {

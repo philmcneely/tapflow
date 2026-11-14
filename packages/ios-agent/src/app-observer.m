@@ -10,6 +10,7 @@
 // **No UIKit or CoreGraphics at link time.** Every process loads this, daemons included, and the gate runs only after
 // load: UIKit is reached at run time, after the gate, by class name, selector and the string values of its constants.
 #import <Foundation/Foundation.h>
+#import <dlfcn.h>
 #import <fcntl.h>
 #import <time.h>
 #import <objc/message.h>
@@ -224,11 +225,218 @@ static double tfo_now_ms(void) {
   return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
 }
 
+// ── acted: whether the app acted on a touch (P2a) ────────────────────────────
+
+/*
+ * Each touch-down's report is followed by a verdict, `touch-<seq>-end.json`: whether the app acted on the touch — a
+ * control it listens to fired, an action was sent, a list selected a row, or a gesture recogniser of the app's reached
+ * Ended — from the down until `TFO_ACT_GRACE_MS` after the lift. Measured on iOS 26.5 (the plan's "P2a measured"):
+ * every such signal comes within 4 ms of the lift, except a single tap waiting for a double tap to fail, at 352 ms.
+ *
+ * `acted` is left out — unknown, never "no" — whenever "nothing fired" would not mean the app did nothing: a touch on a
+ * `surface`, a drag (a pan began), a cancelled touch, a view on the responder chain that handles touches in the app's
+ * own code, React Native's touch handler (it recognises every touch), a verdict closed late on a busy main queue, an
+ * app leaving the foreground, or a private method below that this iOS does not have.
+ *
+ * Every signal goes to every report still open: two touches under a second apart can each be credited with the
+ * other's action, which errs to "acted" — a tap kept, never one dropped. Two fingers lifted far apart (not something
+ * the agent sends) would close the first finger's report early; no path reaches that today.
+ */
+#define TFO_ACT_GRACE_MS 1000   // 352 ms measured for a double tap's single, with room for a triple and a busy queue
+#define TFO_ACT_LATE_MS 150     // a close this late may have run before a signal the app had queued
+#define TFO_OPEN_MAX 4
+#define TFO_OPEN_LIFE_MS 10000
+
+typedef struct {
+  uint64_t seq;
+  double at;            // the down report's `at`: with the seq, what names this touch to the agent
+  uintptr_t touch;      // the UITouch, as an address only: compared, never messaged
+  BOOL up, acted, unknown, panned;
+  uint64_t heldBy;      // a later touch iOS counts as this one's repeat (a double tap): closed with it
+} TFOOpen;
+static TFOOpen g_open[TFO_OPEN_MAX];
+static int g_open_n;
+static BOOL g_hooks_on, g_hooks_whole;
+
+static void tfo_close_seq(uint64_t seq, BOOL unknown);
+
+static void tfo_close_at(int i, BOOL unknown) {
+  TFOOpen o = g_open[i];
+  g_open[i] = g_open[--g_open_n];
+  NSMutableDictionary *out = [@{ @"seq": @(o.seq), @"at": @(o.at), @"bundle": g_bundle } mutableCopy];
+  if (!unknown && !o.unknown && !o.panned && g_hooks_whole) out[@"acted"] = @(o.acted);
+  NSString *path = [g_dir stringByAppendingFormat:@"/touch-%llu-end.json", o.seq];
+  NSData *json = [NSJSONSerialization dataWithJSONObject:out options:0 error:nil];
+  if (json) dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ if (tfo_touches_on()) tfo_write_data(path, json); });
+  // A double tap's first touch waited for its second: it closes with it, the second's action counted for both.
+  for (int k = 0; k < g_open_n; k++) {
+    if (g_open[k].heldBy == o.seq) { if (o.acted) g_open[k].acted = YES; tfo_close_seq(g_open[k].seq, unknown); k = -1; }
+  }
+}
+
+static void tfo_close_seq(uint64_t seq, BOOL unknown) {
+  for (int i = 0; i < g_open_n; i++) if (g_open[i].seq == seq) { tfo_close_at(i, unknown); return; }
+}
+
+static int tfo_open_index(uint64_t seq) {
+  for (int i = 0; i < g_open_n; i++) if (g_open[i].seq == seq) return i;
+  return -1;
+}
+
+static void tfo_mark_all(BOOL acted, BOOL unknown) {
+  for (int i = 0; i < g_open_n; i++) { if (acted) g_open[i].acted = YES; if (unknown) g_open[i].unknown = YES; }
+}
+
+/** A new touch-down: older reports past their life are closed unknown, and the oldest gives way when all are taken. */
+static void tfo_open(uint64_t seq, double at, uintptr_t touch, NSInteger tapCount) {
+  for (int i = g_open_n - 1; i >= 0; i--) if (at - g_open[i].at > TFO_OPEN_LIFE_MS) tfo_close_at(i, YES);
+  if (g_open_n == TFO_OPEN_MAX) {
+    int oldest = 0;
+    for (int i = 1; i < g_open_n; i++) if (g_open[i].at < g_open[oldest].at) oldest = i;
+    tfo_close_at(oldest, YES);
+  }
+  // iOS counts this touch a repeat of the last (a double tap): the touches before it that already lifted wait for it,
+  // since a double-tap recogniser acts only on the second and the first would otherwise close having seen nothing.
+  if (tapCount >= 2) for (int i = 0; i < g_open_n; i++) if (g_open[i].up && !g_open[i].heldBy) g_open[i].heldBy = seq;
+  g_open[g_open_n++] = (TFOOpen){ .seq = seq, .at = at, .touch = touch };
+}
+
+static void tfo_lifted(uintptr_t touch, BOOL cancelled) {
+  for (int i = 0; i < g_open_n; i++) {
+    if (g_open[i].touch != touch || g_open[i].up) continue;
+    g_open[i].up = YES;
+    uint64_t seq = g_open[i].seq;
+    if (cancelled) { tfo_close_at(i, YES); return; }
+    double due = tfo_now_ms() + TFO_ACT_GRACE_MS;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, TFO_ACT_GRACE_MS * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+      int k = tfo_open_index(seq);
+      if (k < 0) return;
+      // Held for the repeat that followed it: closed when that one is.
+      if (g_open[k].heldBy && tfo_open_index(g_open[k].heldBy) >= 0) return;
+      tfo_close_at(k, tfo_now_ms() - due > TFO_ACT_LATE_MS);
+    });
+    return;
+  }
+}
+
+/**
+ * A class answers touches in the app's own code: one of these methods is defined in the app's bundle (the executable,
+ * its frameworks, a debug dylib), not inherited from the system. Such a view can act on a touch with none of the
+ * signals above. Cached per class: a responder chain is walked at every touch-down.
+ */
+static BOOL tfo_handles_touches(Class cls) {
+  static NSMutableDictionary<NSValue *, NSNumber *> *cache;
+  static NSString *bundlePath;
+  if (!cache) { cache = [NSMutableDictionary dictionary]; bundlePath = NSBundle.mainBundle.bundlePath; }
+  NSValue *key = [NSValue valueWithPointer:(__bridge const void *)cls];
+  NSNumber *known = cache[key];
+  if (known) return known.boolValue;
+  BOOL own = NO;
+  const char *sels[] = { "touchesBegan:withEvent:", "touchesMoved:withEvent:", "touchesEnded:withEvent:",
+                         "touchesCancelled:withEvent:", "beginTrackingWithTouch:withEvent:",
+                         "continueTrackingWithTouch:withEvent:", "endTrackingWithTouch:withEvent:" };
+  for (size_t i = 0; i < sizeof sels / sizeof *sels && !own; i++) {
+    Method m = class_getInstanceMethod(cls, sel_registerName(sels[i]));
+    Dl_info info;
+    if (m && dladdr((const void *)method_getImplementation(m), &info) && info.dli_fname) {
+      own = bundlePath.length && strncmp(info.dli_fname, bundlePath.fileSystemRepresentation, strlen(bundlePath.fileSystemRepresentation)) == 0;
+    }
+  }
+  cache[key] = @(own);
+  return own;
+}
+
+static BOOL tfo_chain_handles_touches(id view) {
+  for (id r = view; r; r = tfo_send(r, "nextResponder")) if (tfo_handles_touches(object_getClass(r))) return YES;
+  return NO;
+}
+
+static IMP g_set_state, g_send_actions, g_send_action, g_cv_select, g_tv_select;
+
+/** Not the app's: a recogniser on the window, or one of UIKit's own that watches every touch. */
+static BOOL tfo_ambient(id g) {
+  NSString *name = NSStringFromClass([g class]);
+  for (NSString *prefix in @[ @"_UITouchDurationObserving", @"_UIFlexInteraction", @"_UISystemGestureGate", @"UIScrollViewDelayedTouchesBegan" ]) {
+    if ([name hasPrefix:prefix]) return YES;
+  }
+  return [tfo_send(g, "view") isKindOfClass:NSClassFromString(@"UIWindow")];
+}
+
+static void tfo_set_state(id g, SEL cmd, NSInteger state) {
+  ((void (*)(id, SEL, NSInteger))g_set_state)(g, cmd, state);
+  if (g_open_n == 0 || (state != 1 && state != 3)) return;
+  // A pan beginning makes the touch a drag: nothing a drag did is a tap's action.
+  if ([g isKindOfClass:NSClassFromString(@"UIPanGestureRecognizer")]) {
+    if (state == 1) for (int i = 0; i < g_open_n; i++) if (!g_open[i].up) g_open[i].panned = YES;
+    return;
+  }
+  if (state != 3 || tfo_ambient(g)) return;
+  // React Native's handler recognises every touch, a tap on nothing included: it says nothing about acting.
+  if ([NSStringFromClass([g class]) hasPrefix:@"RCT"]) { tfo_mark_all(NO, YES); return; }
+  tfo_mark_all(YES, NO);
+}
+
+static void tfo_send_actions(id control, SEL cmd, NSUInteger events, id event) {
+  ((void (*)(id, SEL, NSUInteger, id))g_send_actions)(control, cmd, events, event);
+  // An event the app listens for on this control: touch-down included, for a control that acts on it.
+  if (g_open_n && (events & (NSUInteger)tfo_int(control, "allControlEvents"))) tfo_mark_all(YES, NO);
+}
+
+static BOOL tfo_send_action(id app, SEL cmd, SEL action, id target, id sender, id event) {
+  BOOL sent = ((BOOL (*)(id, SEL, SEL, id, id, id))g_send_action)(app, cmd, action, target, sender, event);
+  // The observer's own first-responder probe (a field read) is not the app acting.
+  if (g_open_n && action != sel_registerName("tapflow_captureFirstResponder:")) tfo_mark_all(YES, NO);
+  return sent;
+}
+
+static void tfo_cv_select(id cv, SEL cmd, id path) {
+  ((void (*)(id, SEL, id))g_cv_select)(cv, cmd, path);
+  if (g_open_n) tfo_mark_all(YES, NO);
+}
+
+static void tfo_tv_select(id tv, SEL cmd, id path) {
+  ((void (*)(id, SEL, id))g_tv_select)(tv, cmd, path);
+  if (g_open_n) tfo_mark_all(YES, NO);
+}
+
+static IMP tfo_hook(NSString *cls, const char *sel, IMP imp) {
+  Method m = class_getInstanceMethod(NSClassFromString(cls), sel_registerName(sel));
+  return m ? method_setImplementation(m, imp) : NULL;
+}
+
+/**
+ * Installed the first time a touch arrives while the agent records, never for an app nobody records: until then no
+ * UIKit method is replaced. Each replacement calls the one it replaced, so another SDK's wrapper still chains. Five
+ * private or semi-private methods; if this iOS lacks any, no verdict is written at all — a missing hook would read as
+ * "the app did nothing".
+ */
+static void tfo_install_act_hooks(void) {
+  if (g_hooks_on) return;
+  g_hooks_on = YES;
+  g_set_state = tfo_hook(@"UIGestureRecognizer", "setState:", (IMP)tfo_set_state);
+  g_send_actions = tfo_hook(@"UIControl", "_sendActionsForEvents:withEvent:", (IMP)tfo_send_actions);
+  g_send_action = tfo_hook(@"UIApplication", "sendAction:to:from:forEvent:", (IMP)tfo_send_action);
+  g_cv_select = tfo_hook(@"UICollectionView", "_userSelectItemAtIndexPath:", (IMP)tfo_cv_select);
+  g_tv_select = tfo_hook(@"UITableView", "_userSelectRowAtPendingSelectionIndexPath:", (IMP)tfo_tv_select);
+  g_hooks_whole = g_set_state && g_send_actions && g_send_action && g_cv_select && g_tv_select;
+  // An app leaving the foreground (a link out, a share sheet) is suspended before a verdict's timer: closed now,
+  // unknown unless the app already acted.
+  [NSNotificationCenter.defaultCenter addObserverForName:@"UIApplicationWillResignActiveNotification" object:nil
+                                                   queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) {
+    while (g_open_n) { BOOL acted = g_open[0].acted; tfo_close_at(0, !acted); }
+  }];
+}
+
 static NSString *tfo_surface(id window, id view) {
-  NSString *w = NSStringFromClass([window class]), *v = NSStringFromClass([view class]);
+  NSString *w = NSStringFromClass([window class]);
   if ([w containsString:@"Keyboard"] || [w containsString:@"TextEffects"]) return @"keyboard";
-  if ([v hasPrefix:@"WK"]) return @"web";
-  if ([v hasPrefix:@"Flutter"]) return @"flutter";
+  // The view a touch lands on inside a web view is a plain UIView under WKContentView (iOS 26.5, measured), so the
+  // views it sits in are asked too.
+  for (id v = view; v && v != window; v = tfo_send(v, "superview")) {
+    NSString *name = NSStringFromClass([v class]);
+    if ([name hasPrefix:@"WK"]) return @"web";
+    if ([name hasPrefix:@"Flutter"]) return @"flutter";
+  }
   return nil;
 }
 
@@ -261,12 +469,15 @@ static NSDictionary *tfo_element(id e, id window) {
   return d;
 }
 
-static void tfo_touch_answer(id window, id view, TFOPoint fixed, TFOPoint inWindow, BOOL moving, double at) {
+static void tfo_touch_answer(uint64_t seq, id window, id view, TFOPoint fixed, TFOPoint inWindow, BOOL moving, double at, NSInteger tapCount) {
   NSMutableDictionary *out = [@{
-    @"seq": @(++g_touch_seq), @"at": @(at), @"bundle": g_bundle, @"moving": @(moving),
+    @"seq": @(seq), @"at": @(at), @"bundle": g_bundle, @"moving": @(moving), @"tapCount": @(tapCount),
     @"point": @{ @"x": @(fixed.x), @"y": @(fixed.y) }, @"windowPoint": @{ @"x": @(inWindow.x), @"y": @(inWindow.y) },
   } mutableCopy];
   NSString *surface = tfo_surface(window, view);
+  int open = tfo_open_index(seq);
+  // Nothing is said of a touch on a surface, and nothing can be said of one the app's own code may have handled.
+  if (open >= 0 && (surface || tfo_chain_handles_touches(view))) g_open[open].unknown = YES;
   if (surface) {
     out[@"surface"] = surface;
   } else {
@@ -295,7 +506,7 @@ static void tfo_touch_answer(id window, id view, TFOPoint fixed, TFOPoint inWind
     if (button) out[@"button"] = button;
   }
   // Serialised here, written off the main queue (0.3–0.8 ms measured): only bytes cross, nothing the app may still change.
-  NSString *path = [g_dir stringByAppendingFormat:@"/touch-%llu.json", g_touch_seq];
+  NSString *path = [g_dir stringByAppendingFormat:@"/touch-%llu.json", seq];
   NSData *json = [NSJSONSerialization dataWithJSONObject:out options:0 error:nil];
   // Checked again where it is written: a write still queued when the agent stopped the reports and swept them would
   // leave this one, naming what a person touched, with nothing to sweep it (CodeRabbit, #1166).
@@ -335,10 +546,13 @@ static void tfo_warm_later(id window) {
 static void tfo_send_event(id app, SEL cmd, id event) {
   NSMutableArray *began = nil;
   if (g_dir && tfo_touches_on()) {
+    tfo_install_act_hooks();
     for (id t in tfo_send(event, "allTouches")) {
       NSInteger phase = tfo_int(t, "phase");
       // UITouchPhaseEnded: the screen it leaves — the app's key window, since a key's touch ends in the keyboard's.
       if (phase == 3) tfo_warm_later(tfo_key_window());
+      // Ended or cancelled: the verdict's window starts (a cancel closes it unknown).
+      if (phase == 3 || phase == 4) tfo_lifted((uintptr_t)(__bridge void *)t, phase == 4);
       if (phase != 0) continue;   // UITouchPhaseBegan
       g_warm_gen++;               // a warm-up still pending would run in this touch's frames
       // Two at most: a hit test costs up to 14 ms on the main queue, and the agent never sends more than two fingers.
@@ -360,14 +574,19 @@ static void tfo_send_event(id app, SEL cmd, id event) {
       TFORect fb = tfo_rect(fixedSpace, "bounds"), wb = tfo_rect(window, "bounds");
       if (fb.w <= 0 || fb.h <= 0 || wb.w <= 0 || wb.h <= 0) continue;
       if (!began) began = [NSMutableArray array];
-      [began addObject:@[ window, view ?: NSNull.null, @(f.x / fb.w), @(f.y / fb.h), @(p.x / wb.w), @(p.y / wb.h), @(moving), @(tfo_now_ms()) ]];
+      // Numbered and opened now, before the event is delivered: what the delivery sets off is this touch's.
+      uint64_t seq = ++g_touch_seq;
+      double at = tfo_now_ms();
+      NSInteger tapCount = tfo_int(t, "tapCount");
+      tfo_open(seq, at, (uintptr_t)(__bridge void *)t, tapCount);
+      [began addObject:@[ @(seq), window, view ?: NSNull.null, @(f.x / fb.w), @(f.y / fb.h), @(p.x / wb.w), @(p.y / wb.h), @(moving), @(at), @(tapCount) ]];
     }
   }
   ((void (*)(id, SEL, id))g_send_event)(app, cmd, event);
   for (NSArray *b in began) {
     dispatch_async(dispatch_get_main_queue(), ^{
-      tfo_touch_answer(b[0], b[1] == NSNull.null ? nil : b[1], (TFOPoint){ [b[2] doubleValue], [b[3] doubleValue] },
-                       (TFOPoint){ [b[4] doubleValue], [b[5] doubleValue] }, [b[6] boolValue], [b[7] doubleValue]);
+      tfo_touch_answer([b[0] unsignedLongLongValue], b[1], b[2] == NSNull.null ? nil : b[2], (TFOPoint){ [b[3] doubleValue], [b[4] doubleValue] },
+                       (TFOPoint){ [b[5] doubleValue], [b[6] doubleValue] }, [b[7] boolValue], [b[8] doubleValue], [b[9] integerValue]);
     });
   }
 }

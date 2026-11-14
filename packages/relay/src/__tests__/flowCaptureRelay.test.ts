@@ -364,6 +364,17 @@ describe('Flow Capture through the relay', () => {
       expect(kinds((await snapshot(1))!.entries)).not.toContain('touched')
     })
 
+    // P2a: the app's verdict arrives as a second report for the gesture; a field the relay cannot read is dropped alone.
+    it('keeps the verdict and tap count, and drops a field it cannot read rather than the report', async () => {
+      const alice = await browser(1)
+      await join(alice)
+      await tap(alice, 'r1')
+      agent.send(JSON.stringify({ type: 'capture:touched', sessionId, requestId: 'r1', observation: { ...observation, tapCount: 2, acted: true } }))
+      agent.send(JSON.stringify({ type: 'capture:touched', sessionId, requestId: 'r1', observation: { ...observation, tapCount: 0, acted: 'yes' } }))
+      await expect.poll(async () => (await snapshot(1))!.entries.filter((e) => e.kind === 'touched').map((e) => (e as { touched: unknown }).touched))
+        .toEqual([{ ...observation, tapCount: 2, acted: true }, observation])
+    })
+
     it('tells the agent it keeps them, on every boot', async () => {
       const alice = await browser(1)
       await join(alice)

@@ -2032,6 +2032,16 @@ export interface TouchObservation {
    *  subtitle). Absent when the app built none there (app accessibility off, a touch mid-scroll). */
   element?: ObservedElement
   button?: ObservedElement
+  /** iOS's own count for a quick repeat at one spot (`UITouch.tapCount`): 2 for a double tap's second touch. */
+  tapCount?: number
+  /**
+   * Whether the app acted on this touch: a control it listens to fired, an action was sent, a list selected a row, or
+   * a gesture of the app's own was recognised, from the touch-down until shortly after the lift. Absent is unknown —
+   * never "no": an older agent, a touch on a `surface`, a drag, a view that handles touches itself, React Native, or a
+   * verdict that could not be reached in time. Arrives later than the rest, as a second `capture:touched` for the same
+   * gesture.
+   */
+  acted?: boolean
 }
 
 /** An element as the app's accessibility names it. `label` is absent for a text input, whose label can be its text. */
@@ -2046,7 +2056,8 @@ export interface ObservedElement {
 }
 
 /** Agent → relay: a `TouchObservation` for the gesture `requestId` ended. Sent only to a relay that asked for them
- *  (`touchObservations` on the boot), since an older one logs every message type it does not know. */
+ *  (`touchObservations` on the boot), since an older one logs every message type it does not know. A gesture can get
+ *  two: the second, once the app's verdict (`acted`) is in, repeats the first with it, and replaces it. */
 export interface CaptureTouched {
   type: 'capture:touched'
   sessionId: string

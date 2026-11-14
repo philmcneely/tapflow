@@ -125,7 +125,7 @@ import type { ServiceTier } from '@tapflowio/protocol'
 import { LEAN_LABELS } from '../leanLabels'
 import { TouchHelper } from '../TouchHelper'
 import { XCUITreeReader } from '../XCUITreeReader'
-import { AppObserver, type AppTouch } from '../AppObserver'
+import { AppObserver, type AppTouch, type AppTouchReport } from '../AppObserver'
 import { AppAccessibility } from '../AppAccessibility'
 import { PanelState } from '../PanelState'
 import { PhysicalOrientation, type DeviceOrientation } from '../PhysicalOrientation'
@@ -1033,6 +1033,61 @@ describe('IOSAgent', () => {
       await vi.waitFor(() => expect(sent.filter((m) => m.type === 'capture:touched')).toHaveLength(2), { timeout: 2000 })
       const byId = Object.fromEntries(sent.filter((m) => m.type === 'capture:touched').map((m) => [m['requestId'], (m['observation'] as { moving: boolean }).moving]))
       expect(byId).toEqual({ g1: false, g2: true })
+      watch.mockRestore(); take.mockRestore()
+      agent.disconnect()
+      browser.close()
+    })
+
+    // P2a: the app's verdict follows the down report by a second, and goes to the gesture whose report has its seq.
+    it('sends each gesture the app\'s later verdict by seq, never one from an earlier process or one that says nothing', async () => {
+      const watch = vi.spyOn(AppObserver.prototype, 'watchTouches').mockResolvedValue()
+      const queue: AppTouchReport[][] = []
+      const take = vi.spyOn(AppObserver.prototype, 'takeTouches').mockImplementation(async () => queue.shift() ?? [])
+      const { agent, browser, internals, sent } = await bootedAgent(mockSimctl(true), false)
+      internals.handleRelayMessage({ type: 'device:boot', sessionId: agent.sessionId!, requestId: 'rq-r', payload: { deviceId: 'dev-1', recorded: true, touchObservations: true } } as never)
+      await vi.waitFor(() => expect(sent.some((m) => m.type === 'device:ready')).toBe(true), { timeout: 3000 })
+      internals.lastBundleIds.set('dev-1', 'com.app')
+      const down = (seq: number, at: number, tapCount: number): AppTouch => ({ seq, at, bundle: 'com.app', observation: { point: { x: 0.4, y: 0.5 }, moving: false, tapCount } })
+      const t1 = Date.now()
+      internals.handleRelayMessage({ type: 'input:touch:start', sessionId: agent.sessionId!, payload: { x: 0.4, y: 0.5 } } as never)
+      queue.push([down(1, t1, 1)])
+      internals.handleRelayMessage({ type: 'input:touch:end', sessionId: agent.sessionId!, requestId: 'g1' } as never)
+      await new Promise((r) => setTimeout(r, 150))
+      const t2 = Date.now()
+      internals.handleRelayMessage({ type: 'input:touch:start', sessionId: agent.sessionId!, payload: { x: 0.4, y: 0.5 } } as never)
+      queue.push([down(2, t2, 2)])
+      internals.handleRelayMessage({ type: 'input:touch:end', sessionId: agent.sessionId!, requestId: 'g2' } as never)
+      await vi.waitFor(() => expect(sent.filter((m) => m.type === 'capture:touched')).toHaveLength(2), { timeout: 2000 })
+      // The second touch's verdict first, an earlier process's seq 1 among them, and a verdict that knows nothing.
+      queue.push([
+        { seq: 2, at: t2, bundle: 'com.app', end: true, acted: true },
+        { seq: 1, at: t1 - 60_000, bundle: 'com.app', end: true, acted: true },
+      ])
+      await vi.waitFor(() => expect(sent.filter((m) => m.type === 'capture:touched')).toHaveLength(3), { timeout: 2000 })
+      queue.push([{ seq: 1, at: t1, bundle: 'com.app', end: true, acted: false }])
+      await vi.waitFor(() => expect(sent.filter((m) => m.type === 'capture:touched')).toHaveLength(4), { timeout: 2000 })
+      const later = sent.filter((m) => m.type === 'capture:touched').slice(2).map((m) => [m['requestId'], (m['observation'] as { acted?: boolean; tapCount?: number })])
+      expect(later).toEqual([['g2', { point: { x: 0.4, y: 0.5 }, moving: false, tapCount: 2, acted: true }], ['g1', { point: { x: 0.4, y: 0.5 }, moving: false, tapCount: 1, acted: false }]])
+      watch.mockRestore(); take.mockRestore()
+      agent.disconnect()
+      browser.close()
+    })
+
+    it('sends nothing more for a verdict that is unknown', async () => {
+      const watch = vi.spyOn(AppObserver.prototype, 'watchTouches').mockResolvedValue()
+      const queue: AppTouchReport[][] = []
+      const take = vi.spyOn(AppObserver.prototype, 'takeTouches').mockImplementation(async () => queue.shift() ?? [])
+      const { agent, browser, internals, sent } = await bootedAgent(mockSimctl(true), false)
+      internals.handleRelayMessage({ type: 'device:boot', sessionId: agent.sessionId!, requestId: 'rq-r', payload: { deviceId: 'dev-1', recorded: true, touchObservations: true } } as never)
+      await vi.waitFor(() => expect(sent.some((m) => m.type === 'device:ready')).toBe(true), { timeout: 3000 })
+      internals.lastBundleIds.set('dev-1', 'com.app')
+      const t = Date.now()
+      internals.handleRelayMessage({ type: 'input:touch:start', sessionId: agent.sessionId!, payload: { x: 0.4, y: 0.5 } } as never)
+      queue.push([{ seq: 7, at: t, bundle: 'com.app', observation: { point: { x: 0.4, y: 0.5 }, moving: false } }], [{ seq: 7, at: t, bundle: 'com.app', end: true }])
+      internals.handleRelayMessage({ type: 'input:touch:end', sessionId: agent.sessionId!, requestId: 'g1' } as never)
+      await vi.waitFor(() => expect(queue).toHaveLength(0), { timeout: 2000 })
+      await new Promise((r) => setTimeout(r, 200))
+      expect(sent.filter((m) => m.type === 'capture:touched')).toHaveLength(1)
       watch.mockRestore(); take.mockRestore()
       agent.disconnect()
       browser.close()

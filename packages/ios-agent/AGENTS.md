@@ -450,6 +450,21 @@ observer answers in the runner's own shapes, so `toKeyboardState` and `toFocused
   after — so one is run 0.7 s after a touch lifts and after the app becomes active, when nothing moves (a touch cancels
   it), and the touch-down's own costs under 5.5 ms; the file is written off the main queue. Frame-count comparisons over
   a run were too noisy to resolve this (one "on" run drew more frames than "off"); time the hook itself instead.
+- **Each touch's report is followed by the app's verdict** (`touch-<seq>-end.json`, P2a): whether the app *acted* on
+  it — a control event it listens for (`allControlEvents`), an action sent, a list row selected, or a recogniser of its
+  own reaching Ended — from the down until 1 s after the lift. Measured on iOS 26.5: every such signal lands within
+  4 ms of the lift except a single tap waiting on a double tap (352 ms); a touch iOS counts as a repeat (`tapCount`, now
+  in the down report) holds the one before it open. The agent matches the verdict by **seq and the down's `at`** (a
+  seq restarts with each app process), never by point and time, and repeats the `capture:touched` with `acted`; the
+  relay and flow-runner keep the later. **Absent `acted` is unknown, never "no"**, and that is what keeps it safe to
+  propose leaving a tap out: a surface, a drag, a cancel, React Native's every-touch handler, a responder whose touch
+  methods are defined in the app's bundle (measured both ways), a close more than 150 ms late, the app resigning
+  active, or any of the five hooked methods missing on this iOS (three are private) all leave it out. The hooks are
+  installed on the first recorded touch, never in an app nobody records, and each returns after the original when no
+  report is open; `sendEvent:` measured the same with and without them (median 0.5–0.7 ms). A recogniser on the
+  window, or UIKit's every-touch ones, is not the app acting (`_UIFlexInteraction` reaches Ended on a nav-bar tap).
+  **A touch inside a web view lands on a plain `UIView`** under `WKContentView` (iOS 26.5), so the surface check walks
+  the superviews; looking at the touched view alone missed every web touch.
 - **App accessibility is on for a person Flow Capture records** (`AppAccessibility`, `ApplicationAccessibilityEnabled`).
   Without it SwiftUI and React Native build no accessibility nodes, so the observer can name neither a SwiftUI field's
   `.accessibilityIdentifier` nor what a touch hit (measured on iOS 26.5: Food Truck, Sample SwiftUI/UIKit, a React Native
