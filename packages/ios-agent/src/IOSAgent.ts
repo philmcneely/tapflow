@@ -414,7 +414,7 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
   private readonly installing = new Map<string, Map<string, number>>()
   // Devices whose app reports each touch-down, while a person is recorded on a relay that keeps them (record-time
   // observation): the gestures sent there, newest last, and the reports not yet paired with one.
-  private readonly touchWatch = new Map<string, { starts: Array<{ x: number; y: number; at: number }>; reports: AppTouch[]; ends: Map<number, AppTouchEnd> }>()
+  private readonly touchWatch = new Map<string, { since: number; starts: Array<{ x: number; y: number; at: number }>; reports: AppTouch[]; ends: Map<number, AppTouchEnd> }>()
   // Holds a macOS power assertion while connected so the host doesn't idle-throttle the
   // simulator capture/encode when the Mac is unattended. No-op off macOS.
   private readonly sleepBlocker: SleepBlocker
@@ -1288,7 +1288,7 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
       if (seq !== state.bootSeq) { this.abandonBoot(state, seq, sessionId, requestId); return }
       // What each touch hits, reported by the app while this person is recorded — only to a relay that keeps it.
       const observeTouches = recorded && touchObservations
-      if (observeTouches) this.touchWatch.set(deviceId, { starts: [], reports: [], ends: new Map() })
+      if (observeTouches) this.touchWatch.set(deviceId, { since: Date.now(), starts: [], reports: [], ends: new Map() })
       else this.touchWatch.delete(deviceId)
       await this.appObserver.watchTouches(deviceId, observeTouches).catch((e: unknown) => {
         logger.warn('could not set the app observer\'s touch reports:', (e as Error).message)
@@ -1528,11 +1528,15 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
     }
   }
 
-  /** Down reports into the list the pairings read, verdicts by seq; verdicts nobody came for are kept to a few. */
-  private keepTouchReports(watch: { reports: AppTouch[]; ends: Map<number, AppTouchEnd> }, taken: AppTouchReport[]): void {
+  /**
+   * Down reports into the list the pairings read, verdicts by seq; verdicts nobody came for are kept to a few. A down
+   * report from before the watch began is a gesture of the boot it replaced, taken off disk across it: kept, a gesture
+   * of the new boot at the same spot could pair with it before its own report lands (CodeRabbit, #1168).
+   */
+  private keepTouchReports(watch: { since: number; reports: AppTouch[]; ends: Map<number, AppTouchEnd> }, taken: AppTouchReport[]): void {
     for (const r of taken) {
       if ('end' in r) watch.ends.set(r.seq, r)
-      else watch.reports.push(r)
+      else if (r.at >= watch.since) watch.reports.push(r)
     }
     for (const seq of watch.ends.keys()) {
       if (watch.ends.size <= TOUCH_END_KEEP) break
